@@ -92,6 +92,7 @@ func waitForAWSImageCapture(ctx context.Context, reader awsImageCaptureReader, i
 				if err := waitCtx.Err(); err != nil {
 					return result, err
 				}
+				result.captureEstablished = true
 				return result, nil
 			}
 		}

@@ -216,3 +216,32 @@ func TestCheckpointManagedWaitStopsAtFailureOrContextBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckpointManagedCreateWaitFalsePreservesPendingSuccess(t *testing.T) {
+	checkpoint := managedCheckpointFixture("chk_pending_success")
+	image := CoordinatorImage{ID: "ami-exact", Provider: "aws", Kind: checkpointKindAWSAMI, State: "pending"}
+	checkpoint.Image.ID, checkpoint.Image.ResourceID = image.ID, image.ID
+	checkpoint.Image.Kind, checkpoint.Image.State = image.Kind, image.State
+	checkpoint.Image.SnapshotIDs = nil
+	calls := 0
+	server, _ := configureManagedCheckpointTest(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/checkpoints" {
+			t.Errorf("non-waiting create introduced observation: %s %s", r.Method, r.URL)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"checkpoint": checkpoint, "image": image})
+	})
+	cfg := defaultConfig()
+	cfg.Provider, cfg.Coordinator, cfg.TargetOS, cfg.WindowsMode = "aws", server.URL, targetWindows, windowsModeNormal
+	record := checkpointRecord{ID: checkpoint.ID, Provider: "aws", LeaseID: checkpoint.LeaseID}
+	ctx := withCheckpointCreateContext(t.Context(), record, checkpointRetentionFromDuration(0), func(bool) error { return nil })
+	result, err := (coordinatorCheckpointDriver{}).Create(ctx, NativeCheckpointCreateRequest{
+		Config: cfg, Server: Server{Provider: "aws", CloudID: "i-exact"}, Target: SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal},
+		CheckpointID: record.ID, LeaseID: record.LeaseID, Strategy: checkpointStrategyImage, Wait: false, WaitTimeout: time.Second, Stderr: io.Discard,
+	})
+	if err != nil || calls != 1 || result.ID != image.ID || result.State != "pending" || result.captureEstablished {
+		t.Fatalf("pending success changed: %+v err=%v calls=%d", result, err, calls)
+	}
+}

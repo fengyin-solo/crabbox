@@ -140,25 +140,28 @@ crabbox checkpoint create --id swift-crab --mode native --json
 --discard-failed            Explicitly discard a verified failed capture and retire.
 ```
 
-On successful artifact creation, `--json` prints the checkpoint record with the
-top-level field `"captureEstablished": true`. This means the point-in-time
+On success, `--json` prints the checkpoint record. The optional top-level field
+`"captureEstablished": true` attests that the provider's capture contract has
+established the point-in-time
 capture of every included volume (or the completed archive's contents) is fixed:
 the source may keep running and writing without changing that capture. It does
 not mean the image is available to fork, nor certify application consistency or
 capture of memory, mounted external storage, or writes after the capture point.
 
-`--wait=false` skips waiting for native availability, but still waits for evidence
-that capture is established. Direct AWS AMIs poll about once per second for the
+`--wait=false` skips waiting for native availability. Direct AWS AMIs still wait
+for evidence that capture is established, polling about once per second for the
 accepted image's exact backing snapshots, matching every source EBS device and
 requiring each snapshot to be `pending` or `completed`. `--wait-timeout` and
 cancellation bound this barrier. Permission errors, terminal failures, and
 timeouts report capture as uncertain and retain the accepted image identity;
-inspect that checkpoint rather than submitting a replacement. Providers that
-cannot attest a fixed capture refuse success while their image is pending.
+inspect that checkpoint rather than submitting a replacement. Other provider
+paths retain their existing success and wait semantics. They attest capture at
+their own established completion boundary, or omit the field if their existing
+contract supplies no evidence yet; an accepted pending image alone is insufficient.
 Native availability polling uses about three seconds; uncertain coordinator
 capture recovery retains its existing fifteen-second cadence.
 
-`--wait` results also include `captureEstablished: true` once capture succeeds.
+`--wait` results also include `captureEstablished: true` once capture is attested.
 Metadata-only recipes, retirement admission receipts, unresolved retirement
 phases, and failures omit the field; absence is never evidence that capture is
 established. A retirement record may attest capture after verified image

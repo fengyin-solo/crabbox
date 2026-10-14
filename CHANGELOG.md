@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Checkpoints: establish every direct AWS backing snapshot before non-waiting success, expose `captureEstablished` for fixed captures, and reduce native availability and AWS public-IP polling slack.
+- Checkpoints: establish every direct AWS backing snapshot before non-waiting success, expose provider-owned `captureEstablished` attestations while preserving other providers' success semantics, and reduce native availability and AWS public-IP polling slack. [PR 2834](https://github.com/openclaw/crabbox/pull/2834).
 - Testbox: announce readiness only after setup succeeds, so failed preparation does not keep an unprepared runner in its idle loop. [PR 2831](https://github.com/openclaw/crabbox/pull/2831).
 - Release verification: check online notarization on each binary's native macOS host while retaining foreign-architecture static checks and a manual online opt-in. [PR 2829](https://github.com/openclaw/crabbox/pull/2829).
 - Release verification: report bounded, attributable macOS notarization diagnostics without changing failed checks or executing rejected binaries. [PR 2823](https://github.com/openclaw/crabbox/pull/2823).

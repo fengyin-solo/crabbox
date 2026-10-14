@@ -248,13 +248,15 @@ capabilities as any other provider that can checkpoint and fork workspace state;
 its Firecracker, Kubernetes, or image identifiers belong inside the adapter and
 checkpoint metadata.
 
-Native checkpoint creation must attest a fixed capture before ordinary success,
-including with `--wait=false`. A completed image state supplies that evidence.
-Adapters with a separate capture barrier and a different image state can set
-`NativeCheckpointCreateResult.CaptureEstablished` after verifying the exact
-capture (for example, a draft image whose underlying snapshot is ready).
+Native adapters retain their own create success and wait semantics. Set
+`NativeCheckpointCreateResult.CaptureEstablished` only where the existing
+provider contract establishes the exact capture (for example, Daytona's active
+snapshot or a draft image whose underlying snapshot is ready). Keep it false
+when the existing operation has only accepted a pending capture; this omits the
+assertion without rejecting normal success or introducing another wait.
 This internal attestation is not serialized into provider results; the CLI emits
 the single top-level `captureEstablished` field in its checkpoint record.
+Core does not reinterpret provider state names as capture barriers.
 An accepted request or allocated image ID alone is insufficient. Preserve accepted
 identity through errors and persist it before any observation or readiness wait.
 

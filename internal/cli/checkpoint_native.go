@@ -71,6 +71,7 @@ func (directAWSAMICheckpointDriver) Create(ctx context.Context, req NativeCheckp
 		if err != nil {
 			return image, err
 		}
+		waited.captureEstablished = true
 		return waited, nil
 	}
 	if req.Capture == nil {
@@ -131,7 +132,9 @@ func (directAzureOSDiskCheckpointDriver) Create(ctx context.Context, req NativeC
 	if err != nil {
 		return CoordinatorImage{}, err
 	}
-	return coordinatorImageFromNativeCheckpoint(snapshot), nil
+	image := coordinatorImageFromNativeCheckpoint(snapshot)
+	image.captureEstablished = true
+	return image, nil
 }
 
 type coordinatorCheckpointDriver struct{}
@@ -236,7 +239,7 @@ func (coordinatorCheckpointDriver) Create(ctx context.Context, req NativeCheckpo
 	if err != nil {
 		return CoordinatorImage{}, err
 	}
-	if req.Wait || (req.Capture == nil && !coordinatorCaptureEstablished(image)) {
+	if req.Wait {
 		var waited CoordinatorImage
 		if managed != nil {
 			waited, err = waitForCheckpointImage(ctx, coord, managed.ID, image.ID, req.WaitTimeout, req.Stderr)
@@ -246,8 +249,10 @@ func (coordinatorCheckpointDriver) Create(ctx context.Context, req NativeCheckpo
 		if err != nil {
 			return image, err
 		}
+		waited.captureEstablished = true
 		return waited, nil
 	}
+	image.captureEstablished = coordinatorCaptureEstablished(image)
 	return image, nil
 }
 
@@ -313,6 +318,7 @@ func waitForCheckpointImage(ctx context.Context, coord *CoordinatorClient, check
 				state = image.State
 				switch strings.ToLower(state) {
 				case "available", "ready", "succeeded", "completed":
+					image.captureEstablished = true
 					return image, nil
 				case "failed", "invalid":
 					return CoordinatorImage{}, Exit(5, "image %s failed", imageID)
@@ -371,14 +377,15 @@ func (d directParallelsCheckpointDriver) Create(ctx context.Context, req NativeC
 		return CoordinatorImage{}, Exit(5, "Parallels snapshot %q state=%s is not forkable; expected poweroff", snapshot.Name, blank(snapshot.State, "unknown"))
 	}
 	return CoordinatorImage{
-		ID:         snapshot.ID,
-		Name:       snapshot.Name,
-		State:      snapshot.State,
-		Provider:   "parallels",
-		Kind:       checkpointKindParallels,
-		ResourceID: req.Server.CloudID,
-		Region:     parallelsHostRefForConfig(cfg),
-		Direct:     true,
+		captureEstablished: true,
+		ID:                 snapshot.ID,
+		Name:               snapshot.Name,
+		State:              snapshot.State,
+		Provider:           "parallels",
+		Kind:               checkpointKindParallels,
+		ResourceID:         req.Server.CloudID,
+		Region:             parallelsHostRefForConfig(cfg),
+		Direct:             true,
 	}, nil
 }
 
@@ -416,10 +423,9 @@ func nativeCheckpointCreateDriver(cfg Config, server Server, target SSHTarget, s
 func (a App) createNativeCheckpointRequest(ctx context.Context, req NativeCheckpointCreateRequest) (CoordinatorImage, map[string]string, error) {
 	if provider, ok := nativeCheckpointLifecycleProvider(req.Config, req.Server); ok {
 		result, err := provider.CreateNativeCheckpoint(ctx, req)
-		if err == nil && req.Capture == nil && !result.CaptureEstablished && !nativeImageAvailable(result.Image.State) {
-			err = Exit(5, "capture of image %s is uncertain in state %s; inspect the retained checkpoint before continuing source writes", result.Image.ID, blank(result.Image.State, "unknown"))
-		}
-		return coordinatorImageFromNativeCheckpoint(result.Image), result.Metadata, err
+		image := coordinatorImageFromNativeCheckpoint(result.Image)
+		image.captureEstablished = err == nil && result.CaptureEstablished
+		return image, result.Metadata, err
 	}
 	driver, ok := nativeCheckpointCreateDriver(req.Config, req.Server, req.Target, req.Strategy)
 	if !ok {

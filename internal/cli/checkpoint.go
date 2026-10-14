@@ -370,6 +370,7 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 				}
 				return err
 			}
+			record.CaptureEstablished = image.captureEstablished
 		case checkpointKindArchive:
 			if err := ensureCheckpointArchiveTarget(target); err != nil {
 				return err
@@ -380,10 +381,8 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 			}
 			record.ArchivePath = checkpointArchive
 			record.ArchiveBytes = bytes
+			record.CaptureEstablished = true
 		}
-		// Metadata-only recipes attest no capture. Native owners return success
-		// only after their capture barrier; archive bytes are fixed at completion.
-		record.CaptureEstablished = record.Kind != checkpointKindRecipe
 		if err := store.Write(record); err != nil {
 			if record.coordinatorManaged() {
 				return fmt.Errorf("coordinator checkpoint %s is durable; recover with crabbox checkpoint inspect %s: %w", record.ID, record.ID, err)

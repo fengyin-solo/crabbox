@@ -662,8 +662,8 @@ type NativeCheckpointCapture struct {
 }
 
 type NativeCheckpointCreateResult struct {
-	// CaptureEstablished attests a fixed capture even when the provider's image
-	// state does not express readiness (for example, a ready draft version).
+	// CaptureEstablished attests a fixed capture under the provider's own
+	// contract. False preserves success semantics and omits the JSON assertion.
 	CaptureEstablished bool `json:"-"`
 	Image              NativeCheckpointImage
 	Metadata           map[string]string

@@ -119,10 +119,13 @@ func TestAWSImageCaptureEstablishedBarrier(t *testing.T) {
 					t.Fatalf("accepted identity lost: %+v", result)
 				}
 				if success {
-					if err != nil || len(result.SnapshotIDs) != 2 || result.State != "pending" || time.Since(start) != time.Second {
+					if err != nil || !result.captureEstablished || len(result.SnapshotIDs) != 2 || result.State != "pending" || time.Since(start) != time.Second {
 						t.Fatalf("barrier=%+v err=%v elapsed=%s", result, err, time.Since(start))
 					}
 				} else {
+					if result.captureEstablished {
+						t.Fatal("uncertain AWS observation attests capture")
+					}
 					if err == nil || !strings.Contains(err.Error(), "uncertain") || strings.Contains(err.Error(), "established") {
 						t.Fatalf("false capture attestation: %v", err)
 					}
