@@ -95,6 +95,7 @@ func TestCheckpointManagedWaitObservesRecoveryBeforeImageReadiness(t *testing.T)
 	for _, outcome := range []string{"available", "deleting"} {
 		t.Run(outcome, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
 				checkpoint := managedCheckpointFixture("chk_recovering")
 				reads, verifies := 0, 0
 				client := &CoordinatorClient{BaseURL: "http://coordinator.test", Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -144,6 +145,9 @@ func TestCheckpointManagedWaitObservesRecoveryBeforeImageReadiness(t *testing.T)
 				}
 				if reads < 3 || verifies != 3 {
 					t.Fatalf("skipped lifecycle or verification: reads=%d verifies=%d", reads, verifies)
+				}
+				if elapsed := time.Since(start); elapsed != 36*time.Second {
+					t.Fatalf("recovery/readiness cadence elapsed=%s, want 15s + 15s + 3s + 3s", elapsed)
 				}
 			})
 		})

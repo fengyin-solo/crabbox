@@ -48,28 +48,29 @@ const (
 )
 
 type checkpointRecord struct {
-	Capture          *NativeCheckpointCapture        `json:"capture,omitempty"`
-	ID               string                          `json:"id"`
-	Name             string                          `json:"name,omitempty"`
-	Kind             string                          `json:"kind"`
-	CreatedAt        string                          `json:"createdAt"`
-	LastUsedAt       string                          `json:"lastUsedAt"`
-	CrabboxVersion   string                          `json:"crabboxVersion"`
-	Provider         string                          `json:"provider,omitempty"`
-	LeaseID          string                          `json:"leaseId,omitempty"`
-	Slug             string                          `json:"slug,omitempty"`
-	TargetOS         string                          `json:"targetOS,omitempty"`
-	WindowsMode      string                          `json:"windowsMode,omitempty"`
-	Desktop          bool                            `json:"desktop,omitempty"`
-	ServerType       string                          `json:"serverType,omitempty"`
-	HostID           string                          `json:"hostId,omitempty"`
-	Workdir          string                          `json:"workdir,omitempty"`
-	ArchivePath      string                          `json:"archivePath,omitempty"`
-	ArchiveBytes     int64                           `json:"archiveBytes,omitempty"`
-	Ownership        *checkpointOwnership            `json:"ownership,omitempty"`
-	Retention        *coordinatorCheckpointRetention `json:"retention,omitempty"`
-	CoordinatorState string                          `json:"coordinatorState,omitempty"`
-	Native           struct {
+	CaptureEstablished bool                            `json:"captureEstablished,omitempty"`
+	Capture            *NativeCheckpointCapture        `json:"capture,omitempty"`
+	ID                 string                          `json:"id"`
+	Name               string                          `json:"name,omitempty"`
+	Kind               string                          `json:"kind"`
+	CreatedAt          string                          `json:"createdAt"`
+	LastUsedAt         string                          `json:"lastUsedAt"`
+	CrabboxVersion     string                          `json:"crabboxVersion"`
+	Provider           string                          `json:"provider,omitempty"`
+	LeaseID            string                          `json:"leaseId,omitempty"`
+	Slug               string                          `json:"slug,omitempty"`
+	TargetOS           string                          `json:"targetOS,omitempty"`
+	WindowsMode        string                          `json:"windowsMode,omitempty"`
+	Desktop            bool                            `json:"desktop,omitempty"`
+	ServerType         string                          `json:"serverType,omitempty"`
+	HostID             string                          `json:"hostId,omitempty"`
+	Workdir            string                          `json:"workdir,omitempty"`
+	ArchivePath        string                          `json:"archivePath,omitempty"`
+	ArchiveBytes       int64                           `json:"archiveBytes,omitempty"`
+	Ownership          *checkpointOwnership            `json:"ownership,omitempty"`
+	Retention          *coordinatorCheckpointRetention `json:"retention,omitempty"`
+	CoordinatorState   string                          `json:"coordinatorState,omitempty"`
+	Native             struct {
 		Provider     string            `json:"provider,omitempty"`
 		ImageID      string            `json:"imageId,omitempty"`
 		Kind         string            `json:"kind,omitempty"`
@@ -380,6 +381,9 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 			record.ArchivePath = checkpointArchive
 			record.ArchiveBytes = bytes
 		}
+		// Metadata-only recipes attest no capture. Native owners return success
+		// only after their capture barrier; archive bytes are fixed at completion.
+		record.CaptureEstablished = record.Kind != checkpointKindRecipe
 		if err := store.Write(record); err != nil {
 			if record.coordinatorManaged() {
 				return fmt.Errorf("coordinator checkpoint %s is durable; recover with crabbox checkpoint inspect %s: %w", record.ID, record.ID, err)

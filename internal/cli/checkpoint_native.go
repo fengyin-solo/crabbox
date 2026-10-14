@@ -17,6 +17,8 @@ type checkpointNativeCreateDriver interface {
 
 type directAWSAMICheckpointDriver struct{}
 
+const nativeCheckpointAvailabilityPollInterval = 3 * time.Second
+
 func (directAWSAMICheckpointDriver) Create(ctx context.Context, req NativeCheckpointCreateRequest) (_ CoordinatorImage, err error) {
 	requestStarted := false
 	defer func() {
@@ -34,6 +36,13 @@ func (directAWSAMICheckpointDriver) Create(ctx context.Context, req NativeCheckp
 	}
 	if _, err := client.ValidateImageCheckpointSource(ctx, req.Server.CloudID); err != nil {
 		return CoordinatorImage{}, err
+	}
+	var devices map[string]string
+	if !req.Wait && req.Capture == nil {
+		devices, err = client.imageCheckpointSourceDevices(ctx, req.Server.CloudID)
+		if err != nil {
+			return CoordinatorImage{}, err
+		}
 	}
 	if !isWindowsNativeTarget(req.Target) {
 		if err := PrepareNativeImageSource(ctx, req.Target); err != nil {
@@ -63,6 +72,13 @@ func (directAWSAMICheckpointDriver) Create(ctx context.Context, req NativeCheckp
 			return image, err
 		}
 		return waited, nil
+	}
+	if req.Capture == nil {
+		captured, err := client.waitForImageCapture(ctx, image, devices, req.WaitTimeout)
+		if err != nil {
+			return captured, err
+		}
+		return captured, nil
 	}
 	return image, nil
 }
@@ -220,7 +236,7 @@ func (coordinatorCheckpointDriver) Create(ctx context.Context, req NativeCheckpo
 	if err != nil {
 		return CoordinatorImage{}, err
 	}
-	if req.Wait {
+	if req.Wait || (req.Capture == nil && !coordinatorCaptureEstablished(image)) {
 		var waited CoordinatorImage
 		if managed != nil {
 			waited, err = waitForCheckpointImage(ctx, coord, managed.ID, image.ID, req.WaitTimeout, req.Stderr)
@@ -233,6 +249,23 @@ func (coordinatorCheckpointDriver) Create(ctx context.Context, req NativeCheckpo
 		return waited, nil
 	}
 	return image, nil
+}
+
+func nativeImageAvailable(state string) bool {
+	switch strings.ToLower(state) {
+	case "available", "ready", "succeeded", "completed":
+		return true
+	}
+	return false
+}
+
+func coordinatorCaptureEstablished(image CoordinatorImage) bool {
+	if nativeImageAvailable(image.State) {
+		return true
+	}
+	// AWS create responses have already passed the coordinator's exact backing
+	// snapshot ownership observation. Upload may still be pending.
+	return image.Provider == "aws" && image.State == "pending" && (len(image.SnapshotIDs) > 0 || len(image.Snapshots) > 0)
 }
 
 func waitForCheckpointImage(ctx context.Context, coord *CoordinatorClient, checkpointID, imageID string, timeout time.Duration, stderr io.Writer) (result CoordinatorImage, err error) {
@@ -250,6 +283,7 @@ func waitForCheckpointImage(ctx context.Context, coord *CoordinatorClient, check
 		}
 	}()
 	for {
+		interval := 15 * time.Second // Keep uncertain capture recovery polling unchanged.
 		checkpoint, err := coord.Checkpoint(waitCtx, checkpointID)
 		if err != nil {
 			return CoordinatorImage{}, err
@@ -264,6 +298,7 @@ func waitForCheckpointImage(ctx context.Context, coord *CoordinatorClient, check
 				return CoordinatorImage{}, Exit(5, "checkpoint %s failed: %s", checkpointID, blank(checkpoint.LastError, "provider capture failed"))
 			}
 		case "ready":
+			interval = nativeCheckpointAvailabilityPollInterval
 			if checkpoint.Image == nil || checkpoint.Image.ID == "" || (imageID != "" && checkpoint.Image.ID != imageID) {
 				return CoordinatorImage{}, Exit(5, "checkpoint %s provider image identity changed or is missing", checkpointID)
 			}
@@ -290,7 +325,7 @@ func waitForCheckpointImage(ctx context.Context, coord *CoordinatorClient, check
 		select {
 		case <-waitCtx.Done():
 			return CoordinatorImage{}, waitCtx.Err()
-		case <-time.After(15 * time.Second):
+		case <-time.After(interval):
 		}
 	}
 }
@@ -381,6 +416,9 @@ func nativeCheckpointCreateDriver(cfg Config, server Server, target SSHTarget, s
 func (a App) createNativeCheckpointRequest(ctx context.Context, req NativeCheckpointCreateRequest) (CoordinatorImage, map[string]string, error) {
 	if provider, ok := nativeCheckpointLifecycleProvider(req.Config, req.Server); ok {
 		result, err := provider.CreateNativeCheckpoint(ctx, req)
+		if err == nil && req.Capture == nil && !result.CaptureEstablished && !nativeImageAvailable(result.Image.State) {
+			err = Exit(5, "capture of image %s is uncertain in state %s; inspect the retained checkpoint before continuing source writes", result.Image.ID, blank(result.Image.State, "unknown"))
+		}
 		return coordinatorImageFromNativeCheckpoint(result.Image), result.Metadata, err
 	}
 	driver, ok := nativeCheckpointCreateDriver(req.Config, req.Server, req.Target, req.Strategy)
@@ -439,10 +477,15 @@ func nativeCheckpointLifecycleProvider(cfg Config, server Server) (NativeCheckpo
 }
 
 func waitForDirectAWSImage(ctx context.Context, client *AWSClient, imageID, accountID string, timeout time.Duration, stderr io.Writer) (CoordinatorImage, error) {
+	ctx, cancel := context.WithTimeoutCause(ctx, timeout, Exit(5, "timed out waiting for image %s", imageID))
+	defer cancel()
 	deadline := time.Now().Add(timeout)
 	var last CoordinatorImage
 	for {
 		image, err := client.GetImageCheckpoint(ctx, imageID)
+		if ctx.Err() != nil {
+			return CoordinatorImage{}, context.Cause(ctx)
+		}
 		if err != nil {
 			return CoordinatorImage{}, err
 		}
@@ -463,8 +506,8 @@ func waitForDirectAWSImage(ctx context.Context, client *AWSClient, imageID, acco
 		_, _ = fmt.Fprintf(stderr, "waiting image=%s state=%s\n", imageID, blank(image.State, "pending"))
 		select {
 		case <-ctx.Done():
-			return CoordinatorImage{}, ctx.Err()
-		case <-time.After(15 * time.Second):
+			return CoordinatorImage{}, context.Cause(ctx)
+		case <-time.After(nativeCheckpointAvailabilityPollInterval):
 		}
 	}
 }
