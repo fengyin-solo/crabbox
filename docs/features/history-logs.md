@@ -226,6 +226,27 @@ These caps are independent of the per-run **64 KiB** streamed-event budget
 described above; events are for live tailing, `logs` is for the full retained
 output.
 
+## Portable local archives
+
+Private local records can be audited off-machine or migrated without copying the
+state directory by hand:
+
+```sh
+crabbox history export --output archive.tar.gz
+crabbox history import archive.tar.gz
+```
+
+The export is a streamed gzip tar with a first-member `manifest.json` carrying
+the schema version, export time, per-record ids, sources, timestamps, relative
+paths, modes, and SHA-256 digests. Only terminal records are exported, files
+keep their owner-private modes, and payloads containing ticket, cookie, or
+environment-key markers are refused. Import verifies the manifest, path safety,
+modes, and digests before an atomic commit; duplicate ids are rejected unless
+`--force` finds an identical terminal record already present. Exports and
+imports never contact the coordinator; a mixed `both` record still merges with a
+coordinator only when its stored reference is acknowledged by the configured
+one. See [`history export/import`](../commands/history.md#exporting-and-importing-local-records).
+
 ## Local debug artifacts
 
 For uncapped, local-only output, mirror the streams to files:

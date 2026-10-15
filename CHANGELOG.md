@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- CLI: `crabbox history export` and `crabbox history import` package terminal local records into a streamed gzip tar with a schema-versioned manifest, per-file SHA-256 digests, preserved owner-private modes and relative `runs/<id>/` paths; exports refuse ticket, cookie, and environment-key markers, imports verify the manifest, path safety, and digests before an atomic commit and only overwrite duplicates with `--force` when an identical terminal record already exists.
+
 ### Fixes
 
 - Serve: preserve CPU and user-idle readings on heavily loaded Macs with independent sampling deadlines and interval-idle CPU measurement, fall back to raw host CPU when container stats fail, and add opt-in per-signal diagnostics.
