@@ -12,7 +12,7 @@ historical checkpoints remain owned by local records under
 `$XDG_STATE_HOME/crabbox/checkpoints`, or
 `<user-config-dir>/crabbox/state/checkpoints` when `XDG_STATE_HOME` is unset.
 
-Subcommands: `create`, `abandon`, `list`, `inspect`, `policy`, `restore`, `fork`, `delete`,
+Subcommands: `create`, `abandon`, `list`, `inspect`, `policy`, `restore`, `repair`, `fork`, `delete`,
 `prune`.
 
 ## Two checkpoint kinds
@@ -27,7 +27,11 @@ storage costs. Recorded as one of `aws-ami`, `aws-ebs-snapshot`,
 
 **Archive (workspace tarball)** — captures only the contents of the remote
 workdir as `workspace.tar.gz`. Portable across any POSIX SSH lease, but it does
-not preserve machine state.
+not preserve machine state. The tarball is published atomically together with a
+`workspace.manifest.json` that records the archive size and sha256 plus every
+file's relative path, type, permission bits, size, and content sha256 (with
+directory and symlink entries included), so truncation and replacement are
+detected before restore rather than during remote unpacking.
 
 `--mode auto` (the default) picks native for providers that support it on the
 current lease and falls back to an archive otherwise. Incus native container
@@ -452,10 +456,18 @@ URL, including its deployment path: coordinators served from `/team-a` and
 > checkpoints still require both local metadata and their provider resource.
 > Archive checkpoints require the local metadata and tarball.
 
-`--verify` audits the other half. For archives it confirms the local tarball
-still exists; for native checkpoints it asks the provider (directly for AWS and
-Hetzner, or via the coordinator) whether the snapshot or image is still present. JSON output
-includes `localState`, `providerState`, and `nextAction`.
+`--verify` audits the other half. For archive checkpoints it streams the
+tarball once and replays it against `workspace.manifest.json`: it recomputes
+the compressed-archive sha256 and size, the entry count, and every file's
+length, permission bits, and content sha256, and reports each damaged entry
+(`missing_entry`, `digest_mismatch`, `size_mismatch`, `mode_mismatch`,
+`link_mismatch`, `extra_entry`) with its repairability. A missing manifest
+marks the tarball `localState: "available_legacy"` (contents unverified);
+damaged manifest-backed archives report `localState: "corrupt_archive"` with
+`nextAction: "repair_or_recreate"`. For native checkpoints it asks the provider
+(directly for AWS and Hetzner, or via the coordinator) whether the snapshot or
+image is still present. JSON output includes `localState`, `providerState`,
+`nextAction`, and an `archive` object with the full damage list.
 
 An existing native record with a missing provider resource reports
 `localState: "metadata_available"`, `providerState: "missing"`, and
@@ -537,7 +549,55 @@ crabbox checkpoint restore --provider parallels --parallels-template tahoe-lates
 
 An archive restore uploads the tarball over SSH and extracts it into the
 workdir. Restoring a non-archive, non-Parallels native checkpoint is an error
-that points you at `checkpoint fork`.
+that points you at `checkpoint fork`. Before uploading, manifest-backed
+archives are replayed locally: a truncated or replaced tarball fails fast with
+the damaged entries instead of unpacking onto a cleared lease workdir. Legacy
+archives without a manifest keep their old read-through behavior.
+
+## repair
+
+Repair a corrupt workspace-archive checkpoint. Verification decides the
+strategy automatically:
+
+- *rebuild manifest* — the archive replays but its manifest is missing or
+  corrupt; the manifest is regenerated locally with no network transfer. This
+  also adopts a legacy archive.
+- *refetch entries* — the manifest is intact; the archive is rebuilt by
+  streaming every still-valid entry from the local tarball and re-transferring
+  only the damaged or missing entries from a lease workdir. Extra entries are
+  dropped locally. Archive-level digest damage with all entries intact
+  recompacts locally and transfers nothing.
+- *recreate* — an unreadable archive without a manifest cannot be repaired;
+  recapture it with `checkpoint create`.
+
+```sh
+# Preview the damage and refetch plan without transferring anything
+crabbox checkpoint repair chk_abc123 --dry-run
+
+# Adopt a legacy archive or rebuild a corrupt manifest (no lease needed)
+crabbox checkpoint repair chk_abc123
+
+# Refetch only the damaged entries from a lease that still has the workdir
+crabbox checkpoint repair chk_abc123 --id target-lease
+crabbox checkpoint repair chk_abc123 --id target-lease --workdir /work/cbx_12/my-app --json
+```
+
+Refetched entries spool per entry under the checkpoint directory, so an
+interrupted repair resumes: entries already spooled and verified are not
+transferred again. The rebuilt tarball is scanned against the manifest before
+it replaces the old one, and both files are published atomically with fsync.
+
+**Flags**
+
+```
+--id <lease>      Lease id or slug whose workdir supplies replacement entries
+                  (required only when entries must be refetched).
+--provider <name> Provider hint.
+--workdir <path>  Workdir to refetch from (default: the captured workdir).
+--dry-run         Report damage and the refetch plan without transferring.
+--json            Print the verification report and refetch plan as JSON.
+--reclaim         Claim the source lease for the current repo.
+```
 
 ## fork
 

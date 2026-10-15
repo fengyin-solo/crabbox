@@ -73,7 +73,7 @@ cat
 			case "screenshot":
 				err = runSSHToWriter(t.Context(), target, "true", &stdout)
 			case "checkpoint":
-				_, err = createCheckpointArchive(t.Context(), target, "/workspace", filepath.Join(dir, "archive.tgz"))
+				_, err = createCheckpointArchive(t.Context(), target, "cbx_0123456789ab", "/workspace", filepath.Join(dir, "archive.tgz"))
 			case "wsl-probe":
 				err = probeWSLStageTransport(t.Context(), target, "10", "3")
 			case "failure":

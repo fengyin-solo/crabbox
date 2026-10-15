@@ -373,7 +373,7 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 			if err := ensureCheckpointArchiveTarget(target); err != nil {
 				return err
 			}
-			bytes, err := createCheckpointArchive(ctx, target, workdir, paths.Archive)
+			bytes, err := createCheckpointArchive(ctx, target, leaseID, workdir, paths.Archive)
 			if err != nil {
 				return err
 			}
@@ -400,11 +400,12 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 }
 
 type checkpointAudit struct {
-	Record        checkpointRecord `json:"record"`
-	LocalState    string           `json:"localState"`
-	ProviderState string           `json:"providerState,omitempty"`
-	NextAction    string           `json:"nextAction"`
-	Error         string           `json:"error,omitempty"`
+	Record        checkpointRecord               `json:"record"`
+	LocalState    string                         `json:"localState"`
+	ProviderState string                         `json:"providerState,omitempty"`
+	NextAction    string                         `json:"nextAction"`
+	Error         string                         `json:"error,omitempty"`
+	Archive       *checkpointArchiveVerification `json:"archive,omitempty"`
 }
 
 type missingCheckpointAudit struct {
@@ -953,6 +954,9 @@ func (a App) checkpointInspect(ctx context.Context, args []string) error {
 		}
 		printCheckpointInspect(a.Stdout, record)
 		fmt.Fprintf(a.Stdout, "local_state=%s\nprovider_state=%s\nnext_action=%s\n", audit.LocalState, blank(audit.ProviderState, "-"), audit.NextAction)
+		if audit.Archive != nil {
+			printCheckpointArchiveReport(a.Stdout, audit.Archive)
+		}
 		if audit.Error != "" {
 			fmt.Fprintf(a.Stdout, "verify_error=%s\n", audit.Error)
 		}
@@ -1186,6 +1190,204 @@ func (a App) checkpointRestore(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Fprintf(a.Stdout, "checkpoint restored id=%s lease=%s workdir=%s\n", record.ID, leaseID, workdir)
+	return nil
+}
+
+type checkpointRepairResult struct {
+	ID          string                         `json:"id"`
+	DryRun      bool                           `json:"dryRun"`
+	Refetched   []string                       `json:"entriesToRefetch,omitempty"`
+	LocalReplay bool                           `json:"localReplay,omitempty"`
+	Report      *checkpointArchiveVerification `json:"report"`
+}
+
+func (a App) checkpointRepair(ctx context.Context, args []string) error {
+	defaults := defaultConfig()
+	fs := newFlagSet("checkpoint repair", a.Stderr)
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
+	id := fs.String("id", "", "lease id or slug whose workdir supplies replacement entries")
+	workdirOverride := fs.String("workdir", "", "remote workdir to refetch entries from")
+	dryRun := fs.Bool("dry-run", false, "report damage and refetch plan without transferring")
+	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	providerFlags := registerProviderFlags(fs, defaults)
+	if err := parseInterspersedFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return Exit(2, "usage: crabbox checkpoint repair <checkpoint-id> [--id <lease-id-or-slug>] [--workdir <dir>]")
+	}
+	store, err := defaultCheckpointStore()
+	if err != nil {
+		return err
+	}
+	record, paths, err := store.Read(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if record.Kind != checkpointKindArchive {
+		return Exit(2, "checkpoint %s has kind=%s; repair supports %s", record.ID, record.Kind, checkpointKindArchive)
+	}
+	archivePath := checkpointArchivePath(paths, record)
+	manifestPath := checkpointManifestPathFor(archivePath)
+	report := verifyLocalCheckpointArchive(archivePath, manifestPath)
+	result := checkpointRepairResult{ID: record.ID, DryRun: *dryRun, Report: report}
+	if report.Verified {
+		if *jsonOut {
+			return json.NewEncoder(a.Stdout).Encode(result)
+		}
+		fmt.Fprintf(a.Stdout, "checkpoint %s already verified; no repair needed\n", record.ID)
+		return nil
+	}
+
+	switch report.Repair {
+	case "rebuild_manifest":
+		result.LocalReplay = true
+		if *jsonOut {
+			if err := json.NewEncoder(a.Stdout).Encode(result); err != nil {
+				return err
+			}
+		} else {
+			fmt.Fprintf(a.Stdout, "would rebuild manifest for checkpoint %s from its local archive (no transfer)\n", record.ID)
+		}
+		if *dryRun {
+			return nil
+		}
+		report, err = adoptCheckpointArchiveManifest(archivePath, manifestPath, checkpointArchive,
+			record.LeaseID, record.Workdir, record.CreatedAt)
+		if err != nil {
+			return Exit(2, "rebuild checkpoint %s manifest: %v", record.ID, err)
+		}
+		result.Report = report
+		record.ArchiveBytes = report.ArchiveSize
+		if err := store.Write(record); err != nil {
+			return err
+		}
+	case "refetch_entries":
+		manifest, loadErr := loadCheckpointArchiveManifest(manifestPath)
+		if loadErr != nil {
+			return Exit(2, "load checkpoint %s manifest: %v", record.ID, loadErr)
+		}
+		refetched := checkpointRefetchPaths(manifest, report)
+		result.Refetched = refetched
+		if *jsonOut {
+			if err := json.NewEncoder(a.Stdout).Encode(result); err != nil {
+				return err
+			}
+		} else {
+			if len(refetched) == 0 {
+				fmt.Fprintf(a.Stdout, "would recompact checkpoint %s archive locally (no entries to refetch)\n", record.ID)
+			} else {
+				fmt.Fprintf(a.Stdout, "would refetch %d entries for checkpoint %s:\n", len(refetched), record.ID)
+				for _, p := range refetched {
+					fmt.Fprintf(a.Stdout, "  %s\n", p)
+				}
+			}
+		}
+		if *dryRun {
+			return nil
+		}
+		var target SSHTarget
+		workdir := strings.TrimSpace(*workdirOverride)
+		if len(refetched) > 0 {
+			if strings.TrimSpace(*id) == "" {
+				return Exit(2, "repairing checkpoint %s requires --id <lease-id-or-slug> whose workdir contains the damaged entries", record.ID)
+			}
+			cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
+			if err != nil {
+				return err
+			}
+			if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
+				return err
+			}
+			if err := requireLeaseID(*id, "crabbox checkpoint repair <checkpoint-id> --id <lease-id-or-slug>", cfg); err != nil {
+				return err
+			}
+			repo, err := findRepo()
+			if err != nil {
+				return err
+			}
+			server, resolvedTarget, leaseID, err := a.resolveNetworkLeaseTargetForRepoWithConfig(ctx, &cfg, *id, true, *reclaim)
+			if err != nil {
+				return err
+			}
+			if err := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, ServerSlug(server), cfg, &server, resolvedTarget, repo.Root, *reclaim); err != nil {
+				return err
+			}
+			target = resolvedTarget
+			if workdir == "" {
+				workdir = checkpointRestoreWorkdir(cfg, leaseID, repo.Name, record.Workdir, "")
+			}
+		} else if workdir == "" {
+			workdir = record.Workdir
+		}
+		transfer := func(transferCtx context.Context, entry checkpointManifestEntry, destination string) error {
+			return transferRemoteCheckpointEntry(transferCtx, target, workdir, entry, destination)
+		}
+		report, err = repairCheckpointArchive(ctx, archivePath, manifestPath, manifest, transfer)
+		if err != nil {
+			return Exit(7, "repair checkpoint %s: %v", record.ID, err)
+		}
+		result.Report = report
+		record.ArchiveBytes = report.ArchiveSize
+		if err := store.Write(record); err != nil {
+			return err
+		}
+	default:
+		return Exit(2, "checkpoint %s archive cannot be repaired incrementally: %s; recreate it with crabbox checkpoint create",
+			record.ID, checkpointDamageList(report))
+	}
+	if !result.Report.Verified {
+		return Exit(7, "checkpoint %s repair did not produce a verified archive: %s", record.ID, checkpointDamageList(result.Report))
+	}
+	if *jsonOut {
+		result.DryRun = false
+		return json.NewEncoder(a.Stdout).Encode(result)
+	}
+	fmt.Fprintf(a.Stdout, "checkpoint repaired id=%s refetched_entries=%d entries=%d bytes=%s\n",
+		record.ID, len(result.Refetched), result.Report.EntryCount, humanBytes(result.Report.ArchiveSize))
+	return nil
+}
+
+func transferRemoteCheckpointEntry(ctx context.Context, target SSHTarget, workdir string, entry checkpointManifestEntry, spoolPath string) error {
+	if err := ensureCheckpointArchiveTarget(target); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(spoolPath), 0o700); err != nil {
+		return Exit(2, "create checkpoint repair spool directory: %v", err)
+	}
+	tmpPath := spoolPath + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return Exit(2, "create checkpoint entry archive: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	transport := sshTransportPreparation{command: remoteCheckpointEntryArchiveCommand(workdir, entry.Path)}
+	var stderr strings.Builder
+	_, runErr := transport.runOnce(ctx, target, "10", "3", file, &stderr, false)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if runErr != nil {
+		return Exit(7, "refetch checkpoint entry %s: %v: %s", entry.Path, runErr, trimFailureDetail(stderr.String()))
+	}
+	if syncErr != nil {
+		return Exit(2, "sync checkpoint entry archive %s: %v", entry.Path, syncErr)
+	}
+	if closeErr != nil {
+		return Exit(2, "close checkpoint entry archive %s: %v", entry.Path, closeErr)
+	}
+	info, err := os.Stat(tmpPath)
+	if err != nil {
+		return Exit(2, "stat checkpoint entry archive %s: %v", entry.Path, err)
+	}
+	if info.Size() == 0 {
+		return Exit(7, "refetch checkpoint entry %s: empty archive", entry.Path)
+	}
+	if err := os.Rename(tmpPath, spoolPath); err != nil {
+		return Exit(2, "publish checkpoint entry archive %s: %v", entry.Path, err)
+	}
 	return nil
 }
 
@@ -2473,26 +2675,45 @@ func (a App) verifyCheckpointResource(ctx context.Context, store checkpointStore
 	switch {
 	case record.Kind == checkpointKindArchive:
 		archivePath := checkpointArchivePath(paths, record)
-		info, err := os.Stat(archivePath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				audit.LocalState = "missing_archive"
-				audit.ProviderState = "not_applicable"
-				audit.NextAction = "delete_or_recreate"
-				return audit, nil
-			}
-			return checkpointAudit{}, Exit(2, "stat checkpoint archive %s: %v", record.ID, err)
-		}
-		if info.IsDir() {
-			audit.LocalState = "invalid_archive"
-			audit.ProviderState = "not_applicable"
+		report := verifyLocalCheckpointArchive(archivePath, checkpointManifestPathFor(archivePath))
+		audit.Archive = report
+		audit.ProviderState = "not_applicable"
+		switch {
+		case report.damage(checkpointDamageArchiveMissing):
+			audit.LocalState = "missing_archive"
 			audit.NextAction = "delete_or_recreate"
 			return audit, nil
+		case report.damage(checkpointDamageArchiveNotFile):
+			audit.LocalState = "invalid_archive"
+			audit.NextAction = "delete_or_recreate"
+			return audit, nil
+		case report.Verified:
+			audit.LocalState = "available"
+			audit.NextAction = "restore_or_fork"
+			return audit, nil
+		case report.Legacy:
+			// Legacy archives remain usable but nothing certifies their contents.
+			audit.LocalState = "available_legacy"
+			audit.NextAction = "restore_or_fork"
+			if report.damage(checkpointDamageArchiveUnreadable) {
+				audit.LocalState = "corrupt_archive"
+				audit.NextAction = "delete_or_recreate"
+				audit.Error = "legacy archive is unreadable and has no manifest to drive repair"
+			} else {
+				audit.Error = "legacy archive without a manifest; contents not verified"
+			}
+			return audit, nil
+		case report.Repair == "rebuild_manifest":
+			audit.LocalState = "corrupt_manifest"
+			audit.NextAction = "repair"
+			audit.Error = "checkpoint manifest is missing or corrupt but the archive replays; run crabbox checkpoint repair " + record.ID
+			return audit, nil
+		default:
+			audit.LocalState = "corrupt_archive"
+			audit.NextAction = "repair_or_recreate"
+			audit.Error = fmt.Sprintf("archive damage: %s", checkpointDamageList(report))
+			return audit, nil
 		}
-		audit.LocalState = "available"
-		audit.ProviderState = "not_applicable"
-		audit.NextAction = "restore_or_fork"
-		return audit, nil
 	case isNativeCheckpointKind(record.Kind):
 		providerID := strings.TrimSpace(record.Native.ImageID)
 		if providerID == "" {
@@ -2915,7 +3136,7 @@ func ensureCheckpointArchiveTarget(target SSHTarget) error {
 	return nil
 }
 
-func createCheckpointArchive(ctx context.Context, target SSHTarget, workdir, localPath string) (size int64, err error) {
+func createCheckpointArchive(ctx context.Context, target SSHTarget, leaseID, workdir, localPath string) (size int64, err error) {
 	if err := ensureCheckpointArchiveTarget(target); err != nil {
 		return 0, err
 	}
@@ -2942,9 +3163,13 @@ func createCheckpointArchive(ctx context.Context, target SSHTarget, workdir, loc
 	transport := sshTransportPreparation{command: remoteCheckpointArchiveCommand(workdir)}
 	var stderr strings.Builder
 	_, runErr := transport.runOnce(ctx, target, "10", "3", file, &stderr, false)
+	syncErr := file.Sync()
 	closeErr := file.Close()
 	if runErr != nil {
 		return 0, Exit(7, "archive checkpoint workdir %s: %v: %s", workdir, runErr, trimFailureDetail(stderr.String()))
+	}
+	if syncErr != nil {
+		return 0, Exit(2, "sync checkpoint archive: %v", syncErr)
 	}
 	if closeErr != nil {
 		return 0, Exit(2, "close checkpoint archive: %v", closeErr)
@@ -2956,8 +3181,19 @@ func createCheckpointArchive(ctx context.Context, target SSHTarget, workdir, loc
 	if info.Size() == 0 {
 		return 0, Exit(7, "archive checkpoint workdir %s: empty archive", workdir)
 	}
-	if err := os.Rename(tmpPath, localPath); err != nil {
-		return 0, Exit(2, "publish checkpoint archive: %v", err)
+	// Replay the captured stream before publication: a truncated or corrupt
+	// transfer must fail the create instead of producing an unusable snapshot.
+	digest, _, entries, scanErr := scanCheckpointArchiveFile(tmpPath)
+	if scanErr != nil {
+		return 0, Exit(7, "archive checkpoint workdir %s: incomplete archive: %v", workdir, scanErr)
+	}
+	manifestPath := checkpointManifestPathFor(localPath)
+	manifest := newCheckpointArchiveManifest(checkpointArchive, info.Size(), digest, leaseID, workdir,
+		time.Now().UTC().Format(time.RFC3339), entries)
+	if publishErr := publishCheckpointArchiveWithManifest(tmpPath, localPath, manifest, manifestPath); publishErr != nil {
+		_ = os.Remove(localPath)
+		_ = os.Remove(manifestPath)
+		return 0, Exit(2, "publish checkpoint archive: %v", publishErr)
 	}
 	published = true
 	return info.Size(), nil
@@ -2974,6 +3210,14 @@ func restoreCheckpointArchive(ctx context.Context, target SSHTarget, localPath, 
 	if info.IsDir() {
 		return Exit(2, "checkpoint archive is a directory: %s", localPath)
 	}
+	// Manifest-backed archives are checked locally so a truncated snapshot
+	// fails before the lease workdir is cleared. Legacy archives without a
+	// manifest keep their previous read-through behavior.
+	report := verifyLocalCheckpointArchive(localPath, checkpointManifestPathFor(localPath))
+	if !report.Legacy && !report.Verified {
+		return Exit(2, "checkpoint %s archive is corrupt (%s); run crabbox checkpoint repair %s --id <lease-id> before restoring: %s",
+			checkpointID, checkpointDamageSummary(report), checkpointID, checkpointDamageList(report))
+	}
 	file, err := os.Open(localPath)
 	if err != nil {
 		return Exit(2, "open checkpoint archive: %v", err)
@@ -2984,6 +3228,34 @@ func restoreCheckpointArchive(ctx context.Context, target SSHTarget, localPath, 
 		return Exit(7, "restore checkpoint %s: %v: %s", checkpointID, err, trimFailureDetail(stderr.String()))
 	}
 	return nil
+}
+
+func checkpointDamageSummary(report *checkpointArchiveVerification) string {
+	if len(report.Damages) == 0 {
+		return "unknown damage"
+	}
+	return report.Damages[0].Code
+}
+
+func checkpointDamageList(report *checkpointArchiveVerification) string {
+	var parts []string
+	for _, damage := range report.Damages {
+		item := damage.Code
+		if damage.Path != "" {
+			item += " " + damage.Path
+		}
+		parts = append(parts, item)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// remoteCheckpointEntryArchiveCommand streams a single manifest entry without
+// recursing, so incremental repair transfers only the damaged paths.
+func remoteCheckpointEntryArchiveCommand(workdir, rel string) string {
+	script := "set -eu\n" +
+		"test -d " + shellQuote(workdir) + "\n" +
+		"tar --no-recursion -C " + shellQuote(workdir) + " -czf - -- " + shellQuote("./"+rel)
+	return "bash -lc " + shellQuote(script)
 }
 
 func remoteCheckpointArchiveCommand(workdir string) string {

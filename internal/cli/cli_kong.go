@@ -550,6 +550,7 @@ type checkpointKongCmd struct {
 	Inspect checkpointInspectKongCmd `cmd:"" passthrough:"" help:"Inspect checkpoint metadata."`
 	Policy  checkpointPolicyKongCmd  `cmd:"" passthrough:"" help:"Update coordinator-managed checkpoint retention."`
 	Restore checkpointRestoreKongCmd `cmd:"" passthrough:"" help:"Restore a checkpoint onto an existing lease."`
+	Repair  checkpointRepairKongCmd  `cmd:"" passthrough:"" help:"Repair a corrupt workspace archive checkpoint by refetching only damaged entries."`
 	Fork    checkpointForkKongCmd    `cmd:"" passthrough:"" help:"Lease a new box from a checkpoint."`
 	Delete  checkpointDeleteKongCmd  `cmd:"" passthrough:"" help:"Delete a checkpoint and provider snapshot."`
 	Prune   checkpointPruneKongCmd   `cmd:"" passthrough:"" help:"Delete checkpoints matching age and kind filters."`
@@ -570,6 +571,9 @@ type checkpointPolicyKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type checkpointRestoreKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type checkpointRepairKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type checkpointForkKongCmd struct {
@@ -928,6 +932,9 @@ func (c *checkpointPolicyKongCmd) Run(ctx context.Context, app App) error {
 }
 func (c *checkpointRestoreKongCmd) Run(ctx context.Context, app App) error {
 	return app.checkpointRestore(ctx, stripKongCommandPath(c.Args, "checkpoint", "restore"))
+}
+func (c *checkpointRepairKongCmd) Run(ctx context.Context, app App) error {
+	return app.checkpointRepair(ctx, stripKongCommandPath(c.Args, "checkpoint", "repair"))
 }
 func (c *checkpointForkKongCmd) Run(ctx context.Context, app App) error {
 	return app.checkpointFork(ctx, stripKongCommandPath(c.Args, "checkpoint", "fork"))

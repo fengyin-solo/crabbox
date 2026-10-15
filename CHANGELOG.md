@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Checkpoint: workspace-archive checkpoints now publish a fsynced `workspace.manifest.json` alongside `workspace.tar.gz` with the archive size/sha256 and per-file path, type, mode, size, and sha256 (including directory and symlink entries); `inspect --verify` streams the archive to check the digest, entry count, lengths, modes, and links and reports each damaged entry with repairability, legacy manifest-less archives are explicitly marked unverified, and the new `crabbox checkpoint repair` command rebuilds the archive by refetching only the damaged entries from a lease with resumable per-entry spooling.
+
 ### Fixes
 
 - Serve: preserve CPU and user-idle readings on heavily loaded Macs with independent sampling deadlines and interval-idle CPU measurement, fall back to raw host CPU when container stats fail, and add opt-in per-signal diagnostics.

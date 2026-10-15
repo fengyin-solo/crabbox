@@ -193,7 +193,7 @@ func TestCreateCheckpointArchiveCleansCreatedDirOnFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := createCheckpointArchive(ctx, SSHTarget{User: "nobody", Host: "127.0.0.1", Port: "1", TargetOS: targetLinux}, "/work/missing", filepath.Join(dir, checkpointArchive))
+	_, err := createCheckpointArchive(ctx, SSHTarget{User: "nobody", Host: "127.0.0.1", Port: "1", TargetOS: targetLinux}, "cbx_0123456789ab", "/work/missing", filepath.Join(dir, checkpointArchive))
 	if err == nil {
 		t.Fatal("expected archive failure")
 	}
@@ -1401,7 +1401,9 @@ func TestCheckpointInspectVerifyArchiveStates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(paths.Archive, []byte("archive"), 0o600); err != nil {
+	if err := os.WriteFile(paths.Archive, buildCheckpointFixtureArchive(t, []checkpointFixtureEntry{
+		{path: "README.md", kind: checkpointManifestEntryFile, mode: 0o644, content: []byte("legacy")},
+	}), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1414,8 +1416,11 @@ func TestCheckpointInspectVerifyArchiveStates(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &audit); err != nil {
 		t.Fatal(err)
 	}
-	if audit.LocalState != "available" || audit.ProviderState != "not_applicable" || audit.NextAction != "restore_or_fork" {
+	if audit.LocalState != "available_legacy" || audit.ProviderState != "not_applicable" || audit.NextAction != "restore_or_fork" {
 		t.Fatalf("audit=%#v", audit)
+	}
+	if audit.Archive == nil || !audit.Archive.Legacy || audit.Archive.Verified {
+		t.Fatalf("archive report=%#v", audit.Archive)
 	}
 
 	if err := os.Remove(paths.Archive); err != nil {
