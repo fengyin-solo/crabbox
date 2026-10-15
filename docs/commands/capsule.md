@@ -103,6 +103,22 @@ above through unchanged. The exit handling encodes the oracle:
 Every replay appends a record (outcome, exit code, duration, kept-lease flag,
 note) to the manifest's `replays` history.
 
+Before a lease is created or reused, replay verifies every manifest artifact
+reference that carries a local `path`:
+
+- the path must be slash-separated and relative, with no absolute path,
+  Windows drive letter, backslash separator, or `..` component;
+- the resolved file must stay inside the capsule directory, so symbolic links
+  to directories or to files outside the capsule are rejected;
+- the file's size and `sha256` digest must match the manifest.
+
+A missing file, size mismatch, digest mismatch, or malformed digest is reported
+with the evidence name, path, and concrete reason; replay then exits nonzero
+without contacting a runner, so tampered evidence can never be judged as the
+original failure. Artifact references that predate digest declaration are
+marked `unverified`: replay prints a warning and proceeds, but such evidence is
+not treated as trusted.
+
 Replay can target an environment prepared by other Crabbox features:
 
 ```sh
@@ -122,11 +138,23 @@ Print a summary of a capsule manifest.
 ```sh
 crabbox capsule inspect <capsule.yaml>
 crabbox capsule inspect <capsule.yaml> --json
+crabbox capsule inspect <capsule.yaml> --no-verify
 ```
 
 `inspect` prints the capsule id, class, scenario, source run, replay command and
 required quality, oracle type and failure signature, the most recent replay (if
-any), and promotion state. `--json` emits the full manifest.
+any), promotion state, and one line per local evidence reference with its
+verification status:
+
+- `status=verified` — size and sha256 match the manifest;
+- `status=unverified` — historical reference without a declared digest;
+- `status=invalid` — unsafe path, missing file, directory/symlink target, size
+  mismatch, or digest mismatch, including the concrete reason.
+
+Verification is read-only and runs by default; `--no-verify` skips it. Any
+`invalid` evidence makes `inspect` exit nonzero after listing every result.
+`--json` emits the full manifest plus an `evidence` array of the same
+verification results.
 
 ## promote
 

@@ -255,6 +255,35 @@ When no failure signature can be derived, `oracle.success_condition` is the
 weaker "The replay command exits non-zero." and the `failure_signature` field is
 omitted; any non-zero replay then counts as a reproduction.
 
+### Evidence verification
+
+Artifact references with a local `path` (captured logs and manifests) carry a
+byte size and a `sha256:` digest. `crabbox capsule inspect` verifies them by
+default and prints one result per reference, and `crabbox capsule replay`
+verifies them before creating or reusing a lease:
+
+1. the path is checked as text: it must be a slash-separated relative path;
+   absolute paths, Windows drive letters, backslash separators, and `..`
+   components are rejected before any file is opened;
+2. the path is resolved inside the capsule directory; symbolic links that point
+   at directories or at files outside the capsule (including through a
+   symlinked parent directory) are rejected;
+3. the file must exist, be a regular file, match the declared size, and match
+   the declared sha256 digest.
+
+Missing files, size mismatches, digest mismatches, and malformed digest
+declarations produce distinct errors that name the evidence, its path, and the
+concrete cause. Any such failure blocks replay and makes `inspect` exit
+nonzero, so a truncated or edited `logs/failed.log` can never be replayed as if
+it were the original failure evidence. Verification only opens files read-only
+and never changes capsule contents or permissions.
+
+References without a declared digest (capsules written before verification
+existed) remain readable: they are reported as `unverified` by `inspect`, and
+replay prints a warning before proceeding instead of silently treating them as
+trusted. URL-only references (remote GitHub artifacts) are not local evidence
+and are skipped.
+
 The core contract is deliberately small. Future replay classes add their own
 data under `extensions` without changing the base manifest.
 

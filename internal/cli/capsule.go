@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -118,6 +119,24 @@ type capsuleArtifactRef struct {
 	URL    string `yaml:"url,omitempty" json:"url,omitempty"`
 	Size   int64  `yaml:"size,omitempty" json:"size,omitempty"`
 	Digest string `yaml:"digest,omitempty" json:"digest,omitempty"`
+}
+
+type capsuleEvidenceStatus string
+
+const (
+	capsuleEvidenceVerified   capsuleEvidenceStatus = "verified"
+	capsuleEvidenceUnverified capsuleEvidenceStatus = "unverified"
+	capsuleEvidenceInvalid    capsuleEvidenceStatus = "invalid"
+)
+
+// capsuleEvidenceResult records the verification outcome of one manifest
+// artifact reference that points at a local capsule file.
+type capsuleEvidenceResult struct {
+	Group  string                `yaml:"group" json:"group"`
+	Name   string                `yaml:"name" json:"name"`
+	Path   string                `yaml:"path" json:"path"`
+	Status capsuleEvidenceStatus `yaml:"status" json:"status"`
+	Reason string                `yaml:"reason,omitempty" json:"reason,omitempty"`
 }
 
 type capsuleReplayRecord struct {
@@ -309,6 +328,16 @@ func (a App) capsuleReplay(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Verify local evidence before creating or reusing any lease: a missing,
+	// truncated, tampered, or path-escaping evidence file must never be used
+	// as the original failure proof that replay outcomes are judged against.
+	evidenceResults := verifyCapsuleEvidence(manifest, filepath.Dir(path))
+	if failures := capsuleEvidenceByStatus(evidenceResults, capsuleEvidenceInvalid); len(failures) > 0 {
+		return Exit(1, "capsule evidence verification failed for %s; refusing replay:\n%s", path, formatCapsuleEvidenceFailures(failures))
+	}
+	for _, result := range capsuleEvidenceByStatus(evidenceResults, capsuleEvidenceUnverified) {
+		fmt.Fprintf(a.Stderr, "warning: evidence %q (%s) is unverified: %s; proceeding with replay, but it must not be treated as trusted original-failure evidence\n", result.Name, result.Path, result.Reason)
+	}
 	if strings.TrimSpace(manifest.Replay.Command) == "" {
 		return Exit(2, "capsule %s has no replay.command", path)
 	}
@@ -381,10 +410,11 @@ func (a App) capsuleReplay(ctx context.Context, args []string) error {
 }
 
 func (a App) capsuleInspect(ctx context.Context, args []string) error {
-	args = moveKnownFlagsBeforePositionals(args, nil, []string{"json"})
+	args = moveKnownFlagsBeforePositionals(args, nil, []string{"json", "no-verify"})
 	args, jsonAnywhere := extractBoolFlag(args, "json")
 	fs := newFlagSet("capsule inspect", a.Stderr)
 	jsonOut := fs.Bool("json", false, "print JSON")
+	noVerify := fs.Bool("no-verify", false, "skip local evidence verification")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -394,23 +424,46 @@ func (a App) capsuleInspect(ctx context.Context, args []string) error {
 	if jsonAnywhere {
 		*jsonOut = true
 	}
-	manifest, err := readCapsuleManifest(capsuleManifestPath(fs.Arg(0)))
+	manifestPath := capsuleManifestPath(fs.Arg(0))
+	manifest, err := readCapsuleManifest(manifestPath)
 	if err != nil {
 		return err
 	}
+	evidenceResults := []capsuleEvidenceResult{}
+	if !*noVerify {
+		evidenceResults = verifyCapsuleEvidence(manifest, filepath.Dir(manifestPath))
+	}
+	failures := capsuleEvidenceByStatus(evidenceResults, capsuleEvidenceInvalid)
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(manifest)
+		out := struct {
+			capsuleManifest
+			Evidence []capsuleEvidenceResult `json:"evidence"`
+		}{capsuleManifest: manifest, Evidence: evidenceResults}
+		if err := json.NewEncoder(a.Stdout).Encode(out); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(a.Stdout, "capsule %s class=%s@%s scenario=%q\n", manifest.CapsuleID, manifest.Class, manifest.ClassVersion, manifest.Scenario)
+		fmt.Fprintf(a.Stdout, "source kind=%s repo=%s run=%s job=%q step=%q\n", manifest.Source.Kind, manifest.Source.Repo, manifest.Source.RunURL, blank(manifest.Source.JobName, "-"), blank(manifest.Source.FailedStep, "-"))
+		fmt.Fprintf(a.Stdout, "replay command=%q required_quality=%s\n", manifest.Replay.Command, manifest.Replay.RequiredQuality)
+		fmt.Fprintf(a.Stdout, "oracle type=%s failure_signature=%q\n", manifest.Oracle.Type, blank(manifest.Oracle.FailureSignature, "-"))
+		if len(manifest.Replays) > 0 {
+			last := manifest.Replays[len(manifest.Replays)-1]
+			fmt.Fprintf(a.Stdout, "last_replay outcome=%s exit=%d duration_ms=%d kept=%t at=%s\n", last.Outcome, last.ExitCode, last.DurationMs, last.KeptLease, last.At)
+		}
+		if manifest.Promotion != nil && manifest.Promotion.Regression {
+			fmt.Fprintf(a.Stdout, "promotion regression=true at=%s\n", manifest.Promotion.PromotedAt)
+		}
+		for _, result := range evidenceResults {
+			line := fmt.Sprintf("evidence group=%s name=%q path=%s status=%s", result.Group, result.Name, result.Path, result.Status)
+			if result.Reason != "" {
+				line += " reason=" + strconv.Quote(result.Reason)
+			}
+			fmt.Fprintln(a.Stdout, line)
+		}
 	}
-	fmt.Fprintf(a.Stdout, "capsule %s class=%s@%s scenario=%q\n", manifest.CapsuleID, manifest.Class, manifest.ClassVersion, manifest.Scenario)
-	fmt.Fprintf(a.Stdout, "source kind=%s repo=%s run=%s job=%q step=%q\n", manifest.Source.Kind, manifest.Source.Repo, manifest.Source.RunURL, blank(manifest.Source.JobName, "-"), blank(manifest.Source.FailedStep, "-"))
-	fmt.Fprintf(a.Stdout, "replay command=%q required_quality=%s\n", manifest.Replay.Command, manifest.Replay.RequiredQuality)
-	fmt.Fprintf(a.Stdout, "oracle type=%s failure_signature=%q\n", manifest.Oracle.Type, blank(manifest.Oracle.FailureSignature, "-"))
-	if len(manifest.Replays) > 0 {
-		last := manifest.Replays[len(manifest.Replays)-1]
-		fmt.Fprintf(a.Stdout, "last_replay outcome=%s exit=%d duration_ms=%d kept=%t at=%s\n", last.Outcome, last.ExitCode, last.DurationMs, last.KeptLease, last.At)
-	}
-	if manifest.Promotion != nil && manifest.Promotion.Regression {
-		fmt.Fprintf(a.Stdout, "promotion regression=true at=%s\n", manifest.Promotion.PromotedAt)
+	if len(failures) > 0 {
+		return Exit(1, "capsule evidence verification failed for %s: %d of %d local evidence reference(s) could not be verified:\n%s", manifestPath, len(failures), len(evidenceResults), formatCapsuleEvidenceFailures(failures))
 	}
 	return nil
 }
@@ -971,6 +1024,180 @@ func capsuleManifestPath(path string) string {
 		return filepath.Join(path, capsuleManifestFileName)
 	}
 	return path
+}
+
+// verifyCapsuleEvidence checks every local-path artifact reference in the
+// manifest. References with no local path (URL-only GitHub artifacts) are
+// skipped. References without a declared digest stay readable for historical
+// capsules and are reported as unverified instead of invalid; every other
+// failure is reported as invalid with a reason naming the concrete cause.
+// Verification is read-only: it never creates, truncates, chmods, or writes
+// capsule files.
+func verifyCapsuleEvidence(manifest capsuleManifest, capsuleDir string) []capsuleEvidenceResult {
+	results := []capsuleEvidenceResult{}
+	groups := []struct {
+		name string
+		refs []capsuleArtifactRef
+	}{
+		{"logs", manifest.Artifacts.Logs},
+		{"github", manifest.Artifacts.GitHub},
+		{"manifests", manifest.Artifacts.Manifests},
+	}
+	for _, group := range groups {
+		for _, ref := range group.refs {
+			if ref.Path == "" {
+				continue
+			}
+			result := capsuleEvidenceResult{Group: group.name, Name: ref.Name, Path: ref.Path}
+			if err := validateCapsuleEvidencePath(ref.Path); err != nil {
+				result.Status = capsuleEvidenceInvalid
+				result.Reason = err.Error()
+				results = append(results, result)
+				continue
+			}
+			if strings.TrimSpace(ref.Digest) == "" {
+				result.Status = capsuleEvidenceUnverified
+				result.Reason = "no digest declared; size and content were not verified"
+				results = append(results, result)
+				continue
+			}
+			result.Status, result.Reason = verifyCapsuleEvidenceFile(capsuleDir, ref)
+			results = append(results, result)
+		}
+	}
+	return results
+}
+
+// validateCapsuleEvidencePath enforces that a manifest evidence path is a
+// slash-separated relative path whose components cannot leave the capsule
+// directory. It rejects absolute paths, Windows drive letters, backslash
+// separators, and upward traversal before any filesystem call is made.
+func validateCapsuleEvidencePath(p string) error {
+	if strings.Contains(p, `\`) {
+		return fmt.Errorf("path %q must not use backslash separators; use forward-slash relative paths", p)
+	}
+	if len(p) >= 2 && p[1] == ':' && isCapsuleEvidenceDriveLetter(p[0]) {
+		return fmt.Errorf("path %q must not use a Windows drive letter; use a path relative to the capsule directory", p)
+	}
+	if strings.HasPrefix(p, "/") {
+		return fmt.Errorf("path %q must be relative to the capsule directory, not absolute", p)
+	}
+	for _, component := range strings.Split(p, "/") {
+		if component == ".." {
+			return fmt.Errorf("path %q must not escape the capsule directory with %q components", p, "..")
+		}
+	}
+	return nil
+}
+
+func isCapsuleEvidenceDriveLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// verifyCapsuleEvidenceFile resolves one evidence reference on disk and
+// checks type, symlink containment, size, digest format, and digest content.
+func verifyCapsuleEvidenceFile(capsuleDir string, ref capsuleArtifactRef) (capsuleEvidenceStatus, string) {
+	fullPath := filepath.Join(capsuleDir, filepath.FromSlash(ref.Path))
+
+	linkInfo, err := os.Lstat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return capsuleEvidenceInvalid, "file does not exist"
+		}
+		return capsuleEvidenceInvalid, fmt.Sprintf("cannot stat file: %v", err)
+	}
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return capsuleEvidenceInvalid, fmt.Sprintf("symbolic link target is not accessible: %v", err)
+	}
+	finalIsSymlink := linkInfo.Mode()&os.ModeSymlink != 0
+	if finalIsSymlink && info.IsDir() {
+		target, _ := os.Readlink(fullPath)
+		return capsuleEvidenceInvalid, fmt.Sprintf("symbolic link points to a directory: %s", target)
+	}
+
+	// Resolve every symlink, including symlinked parent directories, and
+	// require the result to stay inside the capsule directory.
+	resolvedBase, baseErr := filepath.EvalSymlinks(capsuleDir)
+	resolvedTarget, targetErr := filepath.EvalSymlinks(fullPath)
+	if baseErr != nil || targetErr != nil {
+		return capsuleEvidenceInvalid, "cannot resolve path within the capsule directory"
+	}
+	if !capsulePathWithin(resolvedBase, resolvedTarget) {
+		if finalIsSymlink {
+			target, _ := os.Readlink(fullPath)
+			return capsuleEvidenceInvalid, fmt.Sprintf("symbolic link resolves to a file outside the capsule directory: %s", target)
+		}
+		return capsuleEvidenceInvalid, "path resolves outside the capsule directory through a parent symbolic link"
+	}
+	if info.IsDir() {
+		return capsuleEvidenceInvalid, "path points to a directory, not a file"
+	}
+
+	algorithm, encoded, ok := strings.Cut(ref.Digest, ":")
+	if !ok || algorithm != "sha256" {
+		return capsuleEvidenceInvalid, fmt.Sprintf("invalid digest %q: expected sha256:<hex>", ref.Digest)
+	}
+	declared, decodeErr := hex.DecodeString(encoded)
+	if decodeErr != nil || len(declared) != sha256.Size {
+		return capsuleEvidenceInvalid, fmt.Sprintf("invalid digest %q: expected sha256: followed by %d hexadecimal characters", ref.Digest, sha256.Size*2)
+	}
+
+	if info.Size() != ref.Size {
+		return capsuleEvidenceInvalid, fmt.Sprintf("size mismatch: manifest declares %d bytes but the file is %d bytes", ref.Size, info.Size())
+	}
+
+	actual, err := capsuleEvidenceFileSHA256(fullPath)
+	if err != nil {
+		return capsuleEvidenceInvalid, fmt.Sprintf("cannot read file for digest verification: %v", err)
+	}
+	if !bytes.Equal(declared, actual) {
+		return capsuleEvidenceInvalid, fmt.Sprintf("sha256 digest mismatch: manifest declares sha256:%s but the file is sha256:%s", encoded, hex.EncodeToString(actual))
+	}
+	return capsuleEvidenceVerified, ""
+}
+
+func capsulePathWithin(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	rel = filepath.ToSlash(rel)
+	return rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+func capsuleEvidenceFileSHA256(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return nil, err
+	}
+	return hash.Sum(nil), nil
+}
+
+func capsuleEvidenceByStatus(results []capsuleEvidenceResult, status capsuleEvidenceStatus) []capsuleEvidenceResult {
+	var matched []capsuleEvidenceResult
+	for _, result := range results {
+		if result.Status == status {
+			matched = append(matched, result)
+		}
+	}
+	return matched
+}
+
+func formatCapsuleEvidenceFailures(failures []capsuleEvidenceResult) string {
+	var b strings.Builder
+	for _, result := range failures {
+		fmt.Fprintf(&b, "  - evidence %q (%s): %s\n", result.Name, result.Path, result.Reason)
+	}
+	return b.String()
 }
 
 func remoteReplayExitCode(err error) (int, bool) {

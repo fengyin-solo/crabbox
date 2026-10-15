@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Security
+
+- Capsule: `inspect` now verifies every local evidence reference by default and `replay` verifies before creating or reusing a lease, rejecting absolute or traversal paths, Windows drive/backslash paths, directory or out-of-capsule symlinks, missing files, size mismatches, malformed digests, and sha256 mismatches; historical capsules without digests are marked `unverified` and replay warns instead of trusting them.
+
 ### Fixes
 
 - Serve: preserve CPU and user-idle readings on heavily loaded Macs with independent sampling deadlines and interval-idle CPU measurement, fall back to raw host CPU when container stats fail, and add opt-in per-signal diagnostics.
